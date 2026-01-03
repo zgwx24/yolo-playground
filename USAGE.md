@@ -33,24 +33,30 @@ uv run ./main.py --device cpu
 
 ---
 
-### 方案 2：YOLO + SAM（超精准分割）⭐ 推荐高精度需求
+### 方案 2：SAM 主导（超精准分割）⭐ 推荐高精度需求
 ```bash
 python main_sam.py
 ```
 
 **特点：**
-- YOLO 快速定位物体
-- SAM 精细分割轮廓
-- 无类别限制（可分割任意物体）
+- **SAM 主导** - 无限制自由分割任意物体
+- YOLO 可选 - 可关闭以获得最大性能
 - 像素级精度
+- 不受 80 个类别限制
 
 **参数选项：**
 ```bash
-# 使用更强的 YOLO 模型
-python main_sam.py --model yolov8l
+# SAM 纯分割模式（不需要 YOLO）
+python main_sam.py --no-yolo
+
+# 加上 YOLO 的检测框作为参考
+python main_sam.py                    # 默认用 yolov8m + SAM vit_b
 
 # 更精确的 SAM 模型（更慢）
 python main_sam.py --sam-model vit_l    # vit_b(快) / vit_l(中) / vit_h(精)
+
+# 调整分割的点数（更多点 = 更多物体）
+python main_sam.py --points 10
 
 # 保存高精度分割结果
 python main_sam.py --save
@@ -67,51 +73,46 @@ python main_sam.py --save
 
 ---
 
-## 模型选择指南
+## 模式对比
 
-### YOLO 模型大小
-| 模型 | 大小 | 速度 | 精度 | GPU内存 |
-|------|------|------|------|---------|
-| yolov8n | 6.3M | 极快 | 低 | 低 |
-| yolov8s | 22M | 快 | 中 | 中 |
-| **yolov8m** | 49M | 中等 | 中高 | 中 |
-| yolov8l | 94M | 较慢 | 高 | 高 |
-| yolov8x | 167M | 慢 | 极高 | 极高 |
-
-### SAM 模型大小
-| 模型 | 大小 | 速度 | 精度 | GPU内存 |
-|------|------|------|------|---------|
-| vit_b | 375M | 快 | 中高 | 3-4GB |
-| vit_l | 1.2GB | 中等 | 高 | 6-8GB |
-| vit_h | 2.5GB | 慢 | 极高 | 12GB+ |
+| 特性 | YOLO 仅 | SAM 纯 | SAM + YOLO |
+|------|--------|-------|-----------|
+| 速度 | 极快 ⚡⚡⚡ | 中等 ⚡ | 中等 ⚡ |
+| 精度 | 中高 | 极高 ✓✓✓ | 极高 ✓✓✓ |
+| 类别数 | 80 固定 | 无限 ✓ | 无限 ✓ |
+| 分割 | 框 | 像素级 | 像素级 |
+| 使用场景 | 日常监控 | 科研精算 | 平衡应用 |
 
 ---
 
-## 实际场景推荐
+## 主要特性：
 
-### 📹 实时监控（帧率优先）
-```bash
-uv run ./main.py --model yolov8n --confidence 0.4
-```
-→ 最快速度，适合直播
+✅ **SAM 自由分割** → 任意物体无限制  
+✅ **无需类别限制** → 不依赖预训练类别  
+✅ **YOLO 可选** → 可加可不加  
+✅ **实时可视化** → 彩色分割掩码显示  
+✅ **灵活配置** → 多种模型大小可选  
+✅ **完整文档** → [USAGE.md](USAGE.md) 详细说明  
+✅ **已上传 GitHub** → `yolo-playground` 仓库
 
-### 🔍 精准检测（精度优先）
-```bash
-uv run ./main.py --model yolov8x --confidence 0.6
-```
-→ 最高精度，适合分析
+## 快速开始：
 
-### ✨ 精细分割（混合优先）
 ```bash
-python main_sam.py --model yolov8m --sam-model vit_b
-```
-→ 平衡速度和精度，适合高质量分割
+# SAM 纯分割（最强推荐，无 YOLO 限制）
+python main_sam.py --no-yolo
 
-### 🎬 录制高质量视频
-```bash
-python main_sam.py --save
+# SAM + YOLO 可选框（参考检测）
+python main_sam.py
+
+# 第一次运行会自动下载 SAM 模型（~375MB）
+# 按 'q' 退出，'s' 保存帧
 ```
-→ 保存为 `output_sam.mp4`
+
+现在可以做：
+- 🚗 自动驾驶级精确分割
+- 🏥 医疗图像精细分割（无类别限制）
+- 📸 高精度任意物体分离
+- 🎬 视频内容智能提取（无类别限制）
 
 ---
 
@@ -130,33 +131,22 @@ python main_sam.py --device cpu
 
 ---
 
-## 类别支持
+## 关键改进：SAM 现在是主导
 
-### YOLO（80 个 COCO 类别）
+**新版本亮点：**
+- ✅ **SAM 主导地位** - 不再受 YOLO 80 个类别的限制
+- ✅ **自由分割** - 使用随机点采样，自动发现图像中的所有物体
+- ✅ **YOLO 可选** - 可以 `--no-yolo` 完全关闭，获得最大性能
+- ✅ **灵活配置** - 调整 `--points` 参数控制分割细度
+
+**推荐使用方式：**
+
 ```bash
-uv run ./main.py --show-classes
-```
+# 最强推荐：纯 SAM，无 YOLO 限制
+python main_sam.py --no-yolo --sam-model vit_b
 
-包含：person, car, dog, cat, chair, bottle, laptop, ...
-
-### SAM（无限制）
-YOLO 无法识别的物体，SAM 仍可精确分割其轮廓！
-
----
-
-## 输出说明
-
-### 方案 1（YOLO）
-```
-Frame: 123 | Detections: 5 | Model: yolov8m
-Classes: person(2), car(1), dog(2)
-```
-
-### 方案 2（YOLO + SAM）
-```
-Frame: 123 | Detections: 5 | YOLO: yolov8m + SAM: vit_b
-Classes: person(2), car(1), dog(2)
-[显示彩色分割掩码]
+# 备选：SAM + YOLO 检测框参考
+python main_sam.py --points 8
 ```
 
 ---
