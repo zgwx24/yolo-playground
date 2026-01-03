@@ -63,6 +63,12 @@ Examples:
         default=5,
         help="Number of random points for SAM to segment (default: 5)"
     )
+    parser.add_argument(
+        "--fps-limit",
+        type=int,
+        default=0,
+        help="Limit FPS for better performance (0 = no limit)"
+    )
     
     args = parser.parse_args()
     
@@ -74,16 +80,38 @@ Examples:
         yolo_model.to(args.device)
     
     print(f"Loading SAM model (main): {args.sam_model}...")
-    # SAM checkpoint mapping
-    sam_checkpoints = {
-        "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
-        "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
-        "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+    
+    # Download SAM checkpoint if not exists
+    import os
+    from pathlib import Path
+    
+    sam_checkpoint_map = {
+        "vit_b": "sam_vit_b_01ec64.pth",
+        "vit_l": "sam_vit_l_0b3195.pth",
+        "vit_h": "sam_vit_h_4b8939.pth",
     }
+    
+    checkpoint_name = sam_checkpoint_map[args.sam_model]
+    checkpoint_dir = Path.home() / ".cache" / "segment_anything"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / checkpoint_name
+    
+    # Download if not exists
+    if not checkpoint_path.exists():
+        import urllib.request
+        checkpoint_urls = {
+            "vit_b": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+            "vit_l": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth",
+            "vit_h": "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth",
+        }
+        url = checkpoint_urls[args.sam_model]
+        print(f"Downloading {args.sam_model} checkpoint (~{[375, 1200, 2500][['vit_b', 'vit_l', 'vit_h'].index(args.sam_model)]}MB)...")
+        urllib.request.urlretrieve(url, checkpoint_path)
+        print(f"✓ Downloaded to {checkpoint_path}")
     
     try:
         # Initialize SAM (MAIN MODEL)
-        sam = sam_model_registry[args.sam_model](checkpoint=sam_checkpoints[args.sam_model])
+        sam = sam_model_registry[args.sam_model](checkpoint=str(checkpoint_path))
         if args.device == "cuda":
             sam.to(device=torch.device("cuda"))
         else:
@@ -145,9 +173,13 @@ Examples:
     print("=" * 60)
     
     frame_count = 0
+    import time
+    start_time = time.time()
+    frame_times = []
     
     try:
         while True:
+            frame_start = time.time()
             ret, frame = cap.read()
             if not ret:
                 print("Error: Failed to read frame")
@@ -160,55 +192,41 @@ Examples:
             sam_predictor.set_image(frame)
             
             # SAM Auto-segmentation using random points
-            # This finds all salient objects without YOLO
             h, w = frame.shape[:2]
             
             # Generate random points across the image
-            np.random.seed(frame_count % 100)  # Pseudo-random for reproducibility
+            np.random.seed(frame_count % 100)
             input_points = np.random.randint(0, min(h, w), size=(args.points, 2))
-            input_labels = np.ones(args.points)  # All positive points (foreground)
+            input_labels = np.ones(args.points)
             
-            # Get masks from SAM using random points
+            # Get masks from SAM using random points (optimized - only single best mask)
             masks, scores, logits = sam_predictor.predict(
                 point_coords=input_points,
                 point_labels=input_labels,
-                multimask_output=True
+                multimask_output=False  # Only get best mask, not all
             )
             
-            # Use the best mask (highest IoU score)
-            best_mask_idx = np.argmax(scores)
-            best_mask = masks[best_mask_idx]
+            # Process only the best mask
+            best_mask = masks[0]
             
-            # Get all masks for visualization
-            all_objects = []
+            # Color for mask
+            color = (0, 255, 0)
             
-            # Apply SAM masks
-            colors_palette = [
-                (255, 0, 0), (0, 255, 0), (0, 0, 255),
-                (255, 255, 0), (255, 0, 255), (0, 255, 255),
-                (128, 0, 0), (0, 128, 0), (0, 0, 128),
-            ]
+            # Apply mask with transparency (GPU-optimized)
+            mask_image = (best_mask * 255).astype(np.uint8)
+            colored_mask = np.zeros_like(frame)
+            colored_mask[best_mask] = color
+            display_frame = cv2.addWeighted(
+                display_frame, 0.85, colored_mask, 0.15, 0
+            )
             
-            for i, mask in enumerate(masks):
-                # Random color for each mask
-                color = colors_palette[i % len(colors_palette)]
-                
-                # Apply mask with transparency
-                mask_image = (mask * 255).astype(np.uint8)
-                colored_mask = np.zeros_like(frame)
-                colored_mask[mask] = color
-                display_frame = cv2.addWeighted(
-                    display_frame, 0.8, colored_mask, 0.2, 0
-                )
-                
-                # Draw contour
-                contours, _ = cv2.findContours(
-                    mask_image, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-                )
-                cv2.drawContours(display_frame, contours, -1, color, 2)
-                all_objects.append(f"SAM-obj{i+1}")
+            # Draw contour (simplified)
+            contours, _ = cv2.findContours(
+                mask_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            cv2.drawContours(display_frame, contours, -1, color, 1)
             
-            # OPTIONAL: Add YOLO detection boxes on top
+            # OPTIONAL: Add YOLO detection boxes on top (only if enabled)
             yolo_info = ""
             if yolo_model is not None:
                 results = yolo_model(frame, conf=args.confidence, verbose=False)
@@ -232,13 +250,22 @@ Examples:
                         f"{name}({count})" for name, count in detected_classes.items()
                     ])
             
+            # Calculate FPS
+            frame_end = time.time()
+            frame_time = frame_end - frame_start
+            frame_times.append(frame_time)
+            if len(frame_times) > 30:
+                frame_times.pop(0)
+            
+            avg_fps = len(frame_times) / sum(frame_times) if frame_times else 0
+            
             # Display info
             cv2.putText(
                 display_frame,
-                f"Frame: {frame_count} | SAM: {args.sam_model} | Segments: {len(masks)}",
+                f"Frame: {frame_count} | FPS: {avg_fps:.1f} | SAM: {args.sam_model}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.6,
                 (0, 255, 0),
                 2
             )
@@ -246,20 +273,26 @@ Examples:
             if yolo_info:
                 cv2.putText(
                     display_frame,
-                    f"YOLO (optional): {yolo_info}",
-                    (10, 60),
+                    f"YOLO: {yolo_info}",
+                    (10, 55),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    0.5,
                     (0, 165, 255),
-                    2
+                    1
                 )
             
             # Show frame
-            cv2.imshow("SAM Segmentation (YOLO optional)", display_frame)
+            cv2.imshow("SAM Segmentation", display_frame)
             
             # Save frame if enabled
             if out:
                 out.write(display_frame)
+            
+            # FPS limiting if specified
+            if args.fps_limit > 0:
+                sleep_time = max(0, (1.0 / args.fps_limit) - frame_time)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
             
             # Handle keyboard input
             key = cv2.waitKey(1) & 0xFF
