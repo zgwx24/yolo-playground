@@ -20,7 +20,7 @@ Examples:
     parser.add_argument(
         "--model",
         type=str,
-        default="yolov8m",
+        default="yolov8n",
         help="YOLO model to use (optional, for detection boxes). Options: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x"
     )
     parser.add_argument(
@@ -69,6 +69,23 @@ Examples:
         default=0,
         help="Limit FPS for better performance (0 = no limit)"
     )
+    parser.add_argument(
+        "--sam-interval",
+        type=int,
+        default=3,
+        help="Process SAM every N frames (default: 3, higher = faster but less frequent updates)"
+    )
+    parser.add_argument(
+        "--max-resolution",
+        type=int,
+        default=640,
+        help="Maximum resolution for processing (default: 640, lower = faster)"
+    )
+    parser.add_argument(
+        "--use-yolo-for-sam",
+        action="store_true",
+        help="Only run SAM on YOLO-detected regions (much faster, requires YOLO)"
+    )
     
     args = parser.parse_args()
     
@@ -114,6 +131,7 @@ Examples:
         sam = sam_model_registry[args.sam_model](checkpoint=str(checkpoint_path))
         if args.device == "cuda":
             sam.to(device=torch.device("cuda"))
+            # Note: FP16 disabled for stability - SAM has compatibility issues with half precision
         else:
             sam.to(device=torch.device("cpu"))
         sam_predictor = SamPredictor(sam)
@@ -129,30 +147,37 @@ Examples:
         print(f"Error: Cannot open camera device {args.camera}")
         return 1
     
-    # Set camera to maximum resolution
-    resolutions = [
-        (4096, 2304),
-        (3840, 2160),
-        (2560, 1440),
-        (1920, 1080),
-        (1280, 720),
+    # Set camera to optimized resolution for GTX 1060
+    # Lower resolution = faster processing
+    target_resolutions = [
+        (640, 480),   # VGA - best for GTX 1060
+        (800, 600),
+        (1280, 720),  # HD
+        (1920, 1080), # Full HD (may be too slow)
     ]
     
-    max_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    max_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Find best resolution that doesn't exceed max_resolution
+    frame_width = 640
+    frame_height = 480
     
-    for width, height in resolutions:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        if actual_width == width and actual_height == height:
-            max_width = width
-            max_height = height
-            break
+    for width, height in target_resolutions:
+        if width <= args.max_resolution:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if actual_width >= width * 0.9:  # Allow some tolerance
+                frame_width = actual_width
+                frame_height = actual_height
+                break
     
-    frame_width = max_width
-    frame_height = max_height
+    # Force to max_resolution if needed
+    if frame_width > args.max_resolution:
+        scale = args.max_resolution / frame_width
+        frame_width = args.max_resolution
+        frame_height = int(frame_height * scale)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     if fps == 0:
         fps = 30
@@ -170,12 +195,23 @@ Examples:
     print("Press 'q' to quit, 's' to save frame")
     print("=" * 60)
     print("SAM Mode: Universal segmentation (YOLO optional)")
+    print(f"Optimized for GTX 1060: {frame_width}x{frame_height}, SAM every {args.sam_interval} frames")
+    if args.use_yolo_for_sam:
+        print("YOLO-guided SAM: Only processing detected regions (faster)")
     print("=" * 60)
     
     frame_count = 0
     import time
     start_time = time.time()
     frame_times = []
+    
+    # Cache for SAM processing
+    last_sam_mask = None
+    last_sam_frame = None
+    
+    # Enable memory efficient attention if available
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
     
     try:
         while True:
@@ -188,48 +224,11 @@ Examples:
             frame_count += 1
             display_frame = frame.copy()
             
-            # SET IMAGE FOR SAM (MAIN TASK)
-            sam_predictor.set_image(frame)
-            
-            # SAM Auto-segmentation using random points
-            h, w = frame.shape[:2]
-            
-            # Generate random points across the image
-            np.random.seed(frame_count % 100)
-            input_points = np.random.randint(0, min(h, w), size=(args.points, 2))
-            input_labels = np.ones(args.points)
-            
-            # Get masks from SAM using random points (optimized - only single best mask)
-            masks, scores, logits = sam_predictor.predict(
-                point_coords=input_points,
-                point_labels=input_labels,
-                multimask_output=False  # Only get best mask, not all
-            )
-            
-            # Process only the best mask
-            best_mask = masks[0]
-            
-            # Color for mask
-            color = (0, 255, 0)
-            
-            # Apply mask with transparency (GPU-optimized)
-            mask_image = (best_mask * 255).astype(np.uint8)
-            colored_mask = np.zeros_like(frame)
-            colored_mask[best_mask] = color
-            display_frame = cv2.addWeighted(
-                display_frame, 0.85, colored_mask, 0.15, 0
-            )
-            
-            # Draw contour (simplified)
-            contours, _ = cv2.findContours(
-                mask_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            cv2.drawContours(display_frame, contours, -1, color, 1)
-            
-            # OPTIONAL: Add YOLO detection boxes on top (only if enabled)
+            # OPTIONAL: Add YOLO detection boxes first (faster, can guide SAM)
             yolo_info = ""
+            yolo_boxes_list = []
             if yolo_model is not None:
-                results = yolo_model(frame, conf=args.confidence, verbose=False)
+                results = yolo_model(frame, conf=args.confidence, verbose=False, imgsz=640)
                 yolo_boxes = results[0].boxes
                 yolo_detections = len(yolo_boxes)
                 
@@ -245,10 +244,110 @@ Examples:
                         # Draw YOLO box (thin line, minimal intrusion)
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 165, 255), 1)
+                        yolo_boxes_list.append((x1, y1, x2, y2))
                     
                     yolo_info = " + " + ", ".join([
                         f"{name}({count})" for name, count in detected_classes.items()
                     ])
+            
+            # SAM processing - only every N frames to save GPU memory
+            should_process_sam = (frame_count % args.sam_interval == 0) or (last_sam_mask is None)
+            
+            if should_process_sam:
+                # Clear GPU cache before SAM processing
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    # Set memory fraction to prevent OOM
+                    torch.cuda.set_per_process_memory_fraction(0.9)
+                
+                # Resize frame for SAM to reduce memory usage
+                h_orig, w_orig = frame.shape[:2]
+                if max(h_orig, w_orig) > args.max_resolution:
+                    scale = args.max_resolution / max(h_orig, w_orig)
+                    new_w = int(w_orig * scale)
+                    new_h = int(h_orig * scale)
+                    frame_sam = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    frame_sam = frame
+                    new_h, new_w = h_orig, w_orig
+                
+                # SET IMAGE FOR SAM (only when needed)
+                sam_predictor.set_image(frame_sam)
+                
+                # SAM Auto-segmentation using random points or YOLO boxes
+                if args.use_yolo_for_sam and yolo_boxes_list:
+                    # Use YOLO boxes as prompts (much more efficient)
+                    all_masks = []
+                    for x1, y1, x2, y2 in yolo_boxes_list:
+                        # Convert to SAM scale
+                        x1_sam = int(x1 * new_w / w_orig)
+                        y1_sam = int(y1 * new_h / h_orig)
+                        x2_sam = int(x2 * new_w / w_orig)
+                        y2_sam = int(y2 * new_h / h_orig)
+                        
+                        # Use center point of box
+                        center_x = (x1_sam + x2_sam) // 2
+                        center_y = (y1_sam + y2_sam) // 2
+                        
+                        input_points = np.array([[center_x, center_y]])
+                        input_labels = np.array([1])
+                        
+                        masks, scores, logits = sam_predictor.predict(
+                            point_coords=input_points,
+                            point_labels=input_labels,
+                            multimask_output=False
+                        )
+                        all_masks.append(masks[0])
+                    
+                    # Combine all masks
+                    if all_masks:
+                        combined_mask = np.zeros((new_h, new_w), dtype=bool)
+                        for mask in all_masks:
+                            combined_mask = combined_mask | mask
+                        best_mask = combined_mask
+                    else:
+                        best_mask = np.zeros((new_h, new_w), dtype=bool)
+                else:
+                    # Random points approach (original method)
+                    input_points = np.random.randint(0, min(new_h, new_w), size=(args.points, 2))
+                    input_labels = np.ones(args.points)
+                    
+                    masks, scores, logits = sam_predictor.predict(
+                        point_coords=input_points,
+                        point_labels=input_labels,
+                        multimask_output=False
+                    )
+                    best_mask = masks[0]
+                
+                # Resize mask back to original size if needed
+                if (new_h != h_orig) or (new_w != w_orig):
+                    best_mask = cv2.resize(
+                        best_mask.astype(np.uint8), 
+                        (w_orig, h_orig), 
+                        interpolation=cv2.INTER_NEAREST
+                    ).astype(bool)
+                
+                last_sam_mask = best_mask
+                last_sam_frame = frame_count
+            else:
+                # Reuse last mask
+                best_mask = last_sam_mask
+            
+            # Apply mask visualization
+            if best_mask is not None:
+                color = (0, 255, 0)
+                mask_image = (best_mask * 255).astype(np.uint8)
+                colored_mask = np.zeros_like(frame)
+                colored_mask[best_mask] = color
+                display_frame = cv2.addWeighted(
+                    display_frame, 0.85, colored_mask, 0.15, 0
+                )
+                
+                # Draw contour (simplified)
+                contours, _ = cv2.findContours(
+                    mask_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(display_frame, contours, -1, color, 1)
             
             # Calculate FPS
             frame_end = time.time()
@@ -260,14 +359,19 @@ Examples:
             avg_fps = len(frame_times) / sum(frame_times) if frame_times else 0
             
             # Display info
+            sam_status = f"SAM: {args.sam_model} (every {args.sam_interval} frames)"
+            if last_sam_frame:
+                frames_since_sam = frame_count - last_sam_frame
+                sam_status += f" [{frames_since_sam} ago]"
+            
             cv2.putText(
                 display_frame,
-                f"Frame: {frame_count} | FPS: {avg_fps:.1f} | SAM: {args.sam_model}",
+                f"Frame: {frame_count} | FPS: {avg_fps:.1f} | {sam_status}",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.5,
                 (0, 255, 0),
-                2
+                1
             )
             
             if yolo_info:
