@@ -1,15 +1,11 @@
 [project]
 name = "yolo"
 version = "0.1.0"
-description = "YOLO object detection from webcam"
+description = "YOLO object detection from webcam - RTX 4090 CUDA 12.1"
 readme = "README.md"
-requires-python = ">=3.9,<3.14"
-dependencies = [
-    "ultralytics>=8.0",
-    "opencv-python>=4.8",
-    "numpy<2",
-    "segment-anything>=1.0",
-]
+requires-python = ">=3.10,<3.14"
+# 所有依赖通过 requirements.txt 管理
+dependencies = []
 
 [project.scripts]
 yolo-webcam = "main:main"
